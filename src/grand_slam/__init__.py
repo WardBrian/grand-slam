@@ -19,7 +19,7 @@ ATP_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
 # for grand slams, it seems both endpoints are the same
 # WTA_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
 
-UPDATE_RATE = 30
+UPDATE_RATE = 15
 
 
 class Config(bullpen.api.PluginConfig):
@@ -112,6 +112,7 @@ class Data(bullpen.api.PluginData):
     def update(self, force=False) -> UpdateStatus:
         if force or self.__should_update():
             try:
+                live_matches = []
                 matches = []
                 resp = requests.get(ATP_URL, timeout=(5, 15))
                 resp.raise_for_status()
@@ -127,12 +128,21 @@ class Data(bullpen.api.PluginData):
                             try:
                                 m = self.parse_match(tname, c)
                                 if m is not None:
-                                    matches.append(m)
+                                    if m.kind == "ingame":
+                                        live_matches.append(m)
+                                    else:
+                                        matches.append(m)
                             except Exception as e:
                                 LOGGER.exception("Failed to parse match: %s", e)
                                 pass
-                self.match_idx = self.match_idx % len(matches) if matches else 0
-                self.matches = sorted(matches, key=lambda m: m.display_time)
+                LOGGER.debug("Fetched %d tennis matches (%d live)", len(matches) + len(live_matches), len(live_matches))
+
+                if live_matches:
+                    self.match_idx = self.match_idx % len(live_matches)
+                    self.matches = sorted(live_matches, key=lambda m: (m.kind, m.display_time))
+                else:
+                    self.match_idx = self.match_idx % len(matches) if matches else 0
+                    self.matches = sorted(matches, key=lambda m: (m.kind, m.display_time))
             except Exception as e:
                 LOGGER.exception("Failed to fetch grand slam data: %s", e)
                 return UpdateStatus.FAIL
