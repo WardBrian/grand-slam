@@ -1,10 +1,8 @@
 from dataclasses import dataclass, field
-import json
 import time
 import datetime
 import requests
-from typing import TYPE_CHECKING, Optional
-from importlib.resources import files
+from typing import TYPE_CHECKING, Literal, Optional
 
 
 import tzlocal
@@ -18,15 +16,10 @@ if TYPE_CHECKING:
     from RGBMatrixEmulator.emulation.canvas import Canvas
 
 ATP_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard"
-WTA_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
+# for grand slams, it seems both endpoints are the same
+# WTA_URL = "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard"
 
 UPDATE_RATE = 30
-
-
-def _get(url: str) -> dict:
-    resp = requests.get(url, timeout=(5, 15))
-    resp.raise_for_status()
-    return resp.json()
 
 
 class Config(bullpen.api.PluginConfig):
@@ -38,6 +31,7 @@ class Config(bullpen.api.PluginConfig):
         if time_format == TIME_FORMAT_12H:
             self.time_fmt_str += "%p"
         self.tournament_ids = config.plugin_config.get("tournament_ids", [])
+        self.include_doubles = config.plugin_config.get("include_doubles", False)
 
 
 ROUND_ABBR = {
@@ -65,8 +59,8 @@ class Match:
     kind: str  # "pregame" | "ingame" | "postgame"
     away_name: str
     home_name: str
-    round_name: Optional[str] = None
-    display_time: Optional[str] = None
+    round_name: str
+    display_time: str
     venue: Optional[str] = None
     away_sets: list = field(default_factory=list)  # ingame/postgame: per-set game counts
     home_sets: list = field(default_factory=list)
@@ -76,6 +70,30 @@ class Match:
     home_winner: Optional[bool] = None
     status_note: Optional[str] = None  # postgame only -- "Retired"/"Walkover", real non-"Final" outcomes
 
+    def set_winner(self, number: int) -> Optional[Literal["away", "home"]]:
+        if number > len(self.away_sets) or number > len(self.home_sets):
+            return None
+        if self.kind == "postgame" and number == len(self.away_sets) and number == len(self.home_sets):
+            if self.away_winner:
+                return "away"
+            elif self.home_winner:
+                return "home"
+
+        away_set = self.away_sets[number - 1]
+        home_set = self.home_sets[number - 1]
+
+        if max(away_set, home_set) < 6:
+            return None
+        if abs(away_set - home_set) < 2 and max(away_set, home_set) < 7:
+            return None
+
+        if away_set > home_set:
+            return "away"
+        elif home_set > away_set:
+            return "home"
+
+        return None
+
 
 class Data(bullpen.api.PluginData):
     def __init__(self, config: Config) -> None:
@@ -83,6 +101,7 @@ class Data(bullpen.api.PluginData):
         self.year = self.today.year
         self.time_fmt_str = config.time_fmt_str
         self.tournament_ids = config.tournament_ids
+        self.include_doubles = config.include_doubles
 
         self.starttime = time.time()
         self.matches: list[Match] = []
@@ -94,23 +113,26 @@ class Data(bullpen.api.PluginData):
         if force or self.__should_update():
             try:
                 matches = []
-                for url in (ATP_URL, WTA_URL):
-                    data = _get(url)
-                    for e in data.get("events", []):
-                        if self.tournament_ids and e.get("id") not in self.tournament_ids:
+                resp = requests.get(ATP_URL, timeout=(5, 15))
+                resp.raise_for_status()
+                data = resp.json()
+                for e in data.get("events", []):
+                    if self.tournament_ids and e.get("id") not in self.tournament_ids:
+                        continue
+                    tname = e.get("name") or e.get("shortName") or "Tournament"
+                    for g in e.get("groupings", []):
+                        if not self.include_doubles and "doubles" in g["grouping"]["slug"]:
                             continue
-                        tname = e.get("name") or e.get("shortName") or "Tournament"
-                        for g in e.get("groupings", []):
-                            for c in g.get("competitions", []):
-                                try:
-                                    m = self.parse_match(tname, c)
-                                    if m is not None:
-                                        matches.append(m)
-                                except Exception as e:
-                                    LOGGER.exception("Failed to parse match: %s", e)
-                                    pass
+                        for c in g.get("competitions", []):
+                            try:
+                                m = self.parse_match(tname, c)
+                                if m is not None:
+                                    matches.append(m)
+                            except Exception as e:
+                                LOGGER.exception("Failed to parse match: %s", e)
+                                pass
                 self.match_idx = self.match_idx % len(matches) if matches else 0
-                self.matches = matches
+                self.matches = sorted(matches, key=lambda m: m.display_time)
             except Exception as e:
                 LOGGER.exception("Failed to fetch grand slam data: %s", e)
                 return UpdateStatus.FAIL
@@ -139,11 +161,11 @@ class Data(bullpen.api.PluginData):
         if not away or not home:
             return None
 
-        round_name = (c.get("round") or {}).get("displayName")
+        round_name = (c.get("round") or {}).get("displayName", "")
         venue_obj = c.get("venue") or {}
         venue = venue_obj.get("court") or venue_obj.get("fullName")
 
-        m = Match(
+        return Match(
             tournament=tournament,
             kind=kind,
             round_name=round_name,
@@ -151,27 +173,14 @@ class Data(bullpen.api.PluginData):
             home_name=competitor_name(home),
             venue=venue,
             display_time=date.strftime(self.time_fmt_str),
+            away_serving=bool(away.get("possession", False)),
+            away_sets=[int(ls["value"]) for ls in (away.get("linescores") or []) if "value" in ls],
+            away_winner=away.get("winner"),
+            home_serving=bool(home.get("possession", False)),
+            home_sets=[int(ls["value"]) for ls in (home.get("linescores") or []) if "value" in ls],
+            home_winner=home.get("winner"),
+            status_note=status.get("description"),
         )
-
-        if kind == "pregame":
-            return m
-
-        # `linescores` are per-competitor, per-set game counts -- confirmed live, real shape, no
-        # combined-string ambiguity to resolve here (see common.py's own docstring).
-        m.away_sets = [int(ls["value"]) for ls in (away.get("linescores") or []) if "value" in ls]
-        m.home_sets = [int(ls["value"]) for ls in (home.get("linescores") or []) if "value" in ls]
-
-        if kind == "ingame":
-            m.away_serving = bool(away.get("possession"))
-            m.home_serving = bool(home.get("possession"))
-        else:  # postgame
-            m.away_winner = away.get("winner")
-            m.home_winner = home.get("winner")
-            desc = status.get("description")
-            if desc and desc != "Final":
-                m.status_note = desc  # real, confirmed values seen live: "Retired", "Walkover"
-
-        return m
 
     def __should_update(self):
         endtime = time.time()
@@ -197,8 +206,10 @@ class Renderer(bullpen.api.PluginRenderer[Data]):
         self.time_fmt_str = config.time_fmt_str
 
         self.scrolls = -1
-
-        self.bg = colors.graphics_color("default.background")
+        try:
+            self.bg = colors.graphics_color("grand_slam.background")
+        except KeyError:
+            self.bg = colors.graphics_color("default.background")
 
         self.tournament_coords = layout.coords("grand_slam.tournament")
         self.tournament_font = layout.font("grand_slam.tournament")
@@ -206,15 +217,17 @@ class Renderer(bullpen.api.PluginRenderer[Data]):
 
         self.player_font = layout.font("grand_slam.player")
         self.player_color = colors.graphics_color("grand_slam.player")
+
         self.serving_color = colors.graphics_color("grand_slam.serving")
         self.winner_color = colors.graphics_color("grand_slam.winner")
+        self.dropped_set = colors.graphics_color("grand_slam.dropped_set")
 
         self.p1_coords = layout.coords("grand_slam.p1")
         self.p2_coords = layout.coords("grand_slam.p2")
 
-        self.time_coords = layout.coords("grand_slam.time")
-        self.time_font = layout.font("grand_slam.time")
-        self.time_color = colors.graphics_color("grand_slam.time")
+        self.status_coords = layout.coords("grand_slam.status")
+        self.status_font = layout.font("grand_slam.status")
+        self.status_color = colors.graphics_color("grand_slam.status")
 
     def can_render(self, data):
         return bool(data.matches)
@@ -233,7 +246,7 @@ class Renderer(bullpen.api.PluginRenderer[Data]):
             if self.scrolls and self.scrolls % 2 == 0:
                 data.match_idx += 1
                 data.match_idx = data.match_idx % len(data.matches)
-                LOGGER.debug("Moving to trains starting at stop %d", data.match_idx)
+                LOGGER.debug("Rotating to tennis match %d", data.match_idx)
 
         match = data.matches[data.match_idx]
 
@@ -258,103 +271,35 @@ class Renderer(bullpen.api.PluginRenderer[Data]):
             )
         )
 
-        p1_score = " ".join(str(s) for s in match.away_sets)
-        p2_score = " ".join(str(s) for s in match.home_sets)
-        font_width = self.player_font["size"]["width"]
-        length = max(font_width * len(p1_score), font_width * len(p2_score))
-
-        avail = canvas.width - self.p1_coords["x"]
-        name_width = avail - length
-        p1_color = self.player_color
-        if match.away_serving:
-            p1_color = self.serving_color
-        if match.away_winner:
-            p1_color = self.winner_color
-        lengths.append(
-            scrolling_text(
-                canvas,
-                graphics,
-                self.p1_coords["x"],
-                self.p1_coords["y"],
-                name_width,
-                self.player_font,
-                self.player_color,
-                self.bg,
-                match.away_name,
-                scrolling_text_pos,
-                center=False,
-                force_scroll=False,
-            )
-        )
-
-        graphics.DrawText(
-            canvas,
-            self.player_font["font"],
-            self.p1_coords["x"] + name_width,
-            self.p1_coords["y"],
-            p1_color,
-            p1_score,
-        )
-
-        avail = canvas.width - self.p2_coords["x"]
-        name_width = avail - length
-        p2_color = self.player_color
-        if match.home_serving:
-            p2_color = self.serving_color
-        if match.home_winner:
-            p2_color = self.winner_color
-        lengths.append(
-            scrolling_text(
-                canvas,
-                graphics,
-                self.p2_coords["x"],
-                self.p2_coords["y"],
-                name_width,
-                self.player_font,
-                p2_color,
-                self.bg,
-                match.home_name,
-                scrolling_text_pos,
-                center=False,
-                force_scroll=False,
-            )
-        )
-
-        graphics.DrawText(
-            canvas,
-            self.player_font["font"],
-            self.p2_coords["x"] + name_width,
-            self.p2_coords["y"],
-            self.player_color,
-            p2_score,
-        )
+        lengths.append(self._render_player(match, "away", canvas, graphics, scrolling_text_pos))
+        lengths.append(self._render_player(match, "home", canvas, graphics, scrolling_text_pos))
 
         if match.kind == "pregame":
             lengths.append(
                 scrolling_text(
                     canvas,
                     graphics,
-                    self.time_coords["x"],
-                    self.time_coords["y"],
-                    self.time_coords["width"],
-                    self.time_font,
-                    self.time_color,
+                    self.status_coords["x"],
+                    self.status_coords["y"],
+                    self.status_coords["width"],
+                    self.status_font,
+                    self.status_color,
                     self.bg,
                     match.display_time,
                     scrolling_text_pos,
                     force_scroll=False,
                 )
             )
-        elif match.kind == "postgame" and match.status_note:
+        elif match.kind == "postgame" and match.status_note != "Final":
             lengths.append(
                 scrolling_text(
                     canvas,
                     graphics,
-                    self.time_coords["x"],
-                    self.time_coords["y"],
-                    self.time_coords["width"],
-                    self.time_font,
-                    self.time_color,
+                    self.status_coords["x"],
+                    self.status_coords["y"],
+                    self.status_coords["width"],
+                    self.status_font,
+                    self.status_color,
                     self.bg,
                     match.status_note,
                     scrolling_text_pos,
@@ -363,6 +308,63 @@ class Renderer(bullpen.api.PluginRenderer[Data]):
             )
 
         return max(lengths)
+
+    def _render_player(
+        self,
+        match: Match,
+        player: Literal["home", "away"],
+        canvas: "Canvas",
+        graphics: bullpen.api.renderer.graphics,
+        scrolling_text_pos: int,
+    ) -> int:
+
+        coords = self.p2_coords if player == "away" else self.p1_coords
+
+        font_width = self.player_font["size"]["width"]
+
+        num_sets = max(len(match.away_sets), len(match.home_sets))
+        score_length = num_sets * font_width + ((num_sets - 1) * int(font_width // 2) if num_sets > 1 else 0)
+
+        avail = canvas.width - coords["x"]
+        name_width = avail - score_length
+        player_color = self.player_color
+
+        if getattr(match, f"{player}_serving"):
+            player_color = self.serving_color
+        if getattr(match, f"{player}_winner"):
+            player_color = self.winner_color
+
+        pos = scrolling_text(
+            canvas,
+            graphics,
+            coords["x"],
+            coords["y"],
+            name_width,
+            self.player_font,
+            player_color,
+            self.bg,
+            getattr(match, f"{player}_name"),
+            scrolling_text_pos,
+            center=False,
+            force_scroll=False,
+        )
+
+        for i, score in enumerate(getattr(match, f"{player}_sets")):
+            color = self.player_color
+            winner = match.set_winner(i + 1)
+            if winner is not None and winner != player:
+                color = self.dropped_set
+
+            graphics.DrawText(
+                canvas,
+                self.player_font["font"],
+                coords["x"] + name_width + i * int(font_width * 1.5),
+                coords["y"],
+                color,
+                str(score),
+            )
+
+        return pos
 
 
 def load() -> bullpen.api.PLUGIN_DEFINITION:
