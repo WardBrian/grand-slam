@@ -1,4 +1,5 @@
 # grand-slam
+<img width="1965" height="1422" alt="image" src="https://github.com/user-attachments/assets/2ccb5af0-a44f-48c7-bbd8-c14fa58b2ca6" />
 
 A plugin for [mlb-led-scoreboard](https://github.com/WardBrian/mlb-led-scoreboard).
 
